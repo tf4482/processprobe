@@ -8,31 +8,36 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf16"
 )
 
-// Observed process state
-type state int
-
+// Process states as printed
 const (
-	stateUnknown state = iota
-	stateRunning
-	stateStopped
+	stateRunning = "running"
+	stateStopped = "stopped"
+	stateUnknown = "unknown"
+
+	// Exit status of the Linux script when pgrep is unusable
+	unavailableStatus = 3
+	// Room for the remote check beyond the SSH connect deadline
+	checkGrace = 5 * time.Second
 )
 
 // Outcome for one process on one host
 type ProcessStatus struct {
-	Host     RemoteHost
-	Process  string
-	State    state
-	Duration time.Duration
-	Detail   string
+	Host    RemoteHost
+	Process string
+	State   string
+	Reason  string
 }
 
 // Prints 1 or 0 per process; exit 3 when pgrep is unusable
@@ -81,7 +86,7 @@ func shellQuote(argument string) string {
 }
 
 func linuxCommand(processes []string) string {
-	arguments := []string{"sh", "-c", shellQuote(linuxScript), appName}
+	arguments := []string{"sh", "-c", shellQuote(linuxScript), projectName}
 	for _, process := range processes {
 		arguments = append(arguments, shellQuote(process))
 	}
@@ -105,7 +110,13 @@ func runChecks(ctx context.Context, config Config) []ProcessStatus {
 	var group sync.WaitGroup
 	for index, host := range config.Hosts {
 		group.Go(func() {
-			groups[index] = checkHost(ctx, host, limit, config.Settings.TimeoutSeconds)
+			groups[index] = unknownResults(host, "cancelled")
+			select {
+			case limit <- struct{}{}:
+				defer func() { <-limit }()
+				groups[index] = checkHost(ctx, host, config.Settings.Timeout)
+			case <-ctx.Done():
+			}
 		})
 	}
 	group.Wait()
@@ -117,79 +128,97 @@ func runChecks(ctx context.Context, config Config) []ProcessStatus {
 }
 
 // One SSH connection per host covering all its processes
-func checkHost(ctx context.Context, host RemoteHost, limit chan struct{}, timeoutSeconds int) []ProcessStatus {
+func checkHost(ctx context.Context, host RemoteHost, timeout time.Duration) []ProcessStatus {
 	destination := host.Address
 	if host.SSHUser != "" {
 		destination = host.SSHUser + "@" + host.Address
 	}
 	remote := linuxCommand(host.Processes)
-	if host.OS == "Windows" {
+	if host.OS == osWindows {
 		remote = windowsCommand(host.Processes)
 	}
-	started := time.Now()
-	limit <- struct{}{}
-	defer func() { <-limit }()
 
-	// Hard deadline beyond the SSH connect timeout
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds+5)*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, timeout+checkGrace)
 	defer cancel()
 	command := exec.CommandContext(ctx, "ssh",
 		"-o", "BatchMode=yes",
-		"-o", "ConnectTimeout="+strconv.Itoa(timeoutSeconds),
+		"-o", "ConnectTimeout="+strconv.Itoa(max(1, int(math.Ceil(timeout.Seconds())))),
 		"-o", "ConnectionAttempts=1",
 		"-o", "StrictHostKeyChecking=yes",
 		"-p", strconv.Itoa(host.SSHPort),
-		destination, remote)
+		"--", destination, remote)
+	command.Env = append(os.Environ(), "LC_ALL=C")
 	var stdout, stderr bytes.Buffer
 	command.Stdout, command.Stderr = &stdout, &stderr
-	command.WaitDelay = time.Second
+	// Graceful stop first, kill after the delay
+	command.Cancel = func() error { return command.Process.Signal(syscall.SIGTERM) }
+	command.WaitDelay = 500 * time.Millisecond
 	err := command.Run()
-	duration := time.Since(started)
 
 	var exit *exec.ExitError
 	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return unknownResults(host, "timeout")
 	case ctx.Err() != nil:
-		return unknownResults(host, duration, "SSH process check timed out")
-	case errors.As(err, &exit) && exit.ExitCode() == 3:
-		return unknownResults(host, duration, "Remote process-check command is unavailable")
+		return unknownResults(host, "cancelled")
+	case errors.Is(err, exec.ErrNotFound):
+		return unknownResults(host, "missing local dependency: ssh")
+	case errors.As(err, &exit) && exit.ExitCode() == unavailableStatus:
+		return unknownResults(host, "missing remote dependency: pgrep")
 	case errors.As(err, &exit):
-		return unknownResults(host, duration, sshFailureDetail(stderr.String(), exit.ExitCode()))
+		return unknownResults(host, sshFailure(stderr.String(), exit.ExitCode()))
 	case err != nil:
-		return unknownResults(host, duration, fmt.Sprintf("SSH unavailable: %v", err))
+		return unknownResults(host, "check failed: "+strings.Join(strings.Fields(err.Error()), " "))
 	}
 
 	output := strings.Split(strings.TrimSuffix(strings.ReplaceAll(stdout.String(), "\r\n", "\n"), "\n"), "\n")
 	if len(output) != len(host.Processes) {
-		return unknownResults(host, duration, "Remote process check returned invalid output")
+		return unknownResults(host, "invalid remote output")
 	}
 	results := make([]ProcessStatus, len(output))
 	for index, value := range output {
-		results[index] = ProcessStatus{Host: host, Process: host.Processes[index], Duration: duration}
+		results[index] = ProcessStatus{Host: host, Process: host.Processes[index]}
 		switch value {
 		case "1":
 			results[index].State = stateRunning
 		case "0":
 			results[index].State = stateStopped
 		default:
-			return unknownResults(host, duration, "Remote process check returned invalid output")
+			return unknownResults(host, "invalid remote output")
 		}
 	}
 	return results
 }
 
-func unknownResults(host RemoteHost, duration time.Duration, detail string) []ProcessStatus {
+func unknownResults(host RemoteHost, reason string) []ProcessStatus {
 	results := make([]ProcessStatus, len(host.Processes))
 	for index, process := range host.Processes {
-		results[index] = ProcessStatus{Host: host, Process: process, Duration: duration, Detail: detail}
+		results[index] = ProcessStatus{host, process, stateUnknown, reason}
 	}
 	return results
 }
 
-// Last non-empty stderr line, else the exit status
-func sshFailureDetail(stderr string, code int) string {
+// Short, stable reason from the SSH client's stderr
+func sshFailure(stderr string, code int) string {
+	known := [][2]string{
+		{"Host key verification failed", "host key not trusted"},
+		{"REMOTE HOST IDENTIFICATION HAS CHANGED", "host key not trusted"},
+		{"Permission denied", "authentication failed"},
+		{"Could not resolve hostname", "unknown host"},
+		{"Connection refused", "connection refused"},
+		{"timed out", "timeout"},
+		{"No route to host", "host unreachable"},
+		{"Network is unreachable", "host unreachable"},
+	}
+	for _, entry := range known {
+		if strings.Contains(stderr, entry[0]) {
+			return entry[1]
+		}
+	}
+	// Otherwise the last line the client or remote shell printed
 	lines := strings.Split(stderr, "\n")
 	for index := len(lines) - 1; index >= 0; index-- {
-		if line := strings.TrimSpace(lines[index]); line != "" {
+		if line := strings.Join(strings.Fields(lines[index]), " "); line != "" {
 			return line
 		}
 	}

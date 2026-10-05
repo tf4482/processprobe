@@ -2,12 +2,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// Deadline for reaching the database
+const connectSeconds = 10
 
 // Update rows matched by (name, host, os); insert the missing ones
 const persistQuery = `
@@ -42,10 +48,7 @@ inserted AS (
 SELECT (SELECT count(*) FROM updated), (SELECT count(*) FROM inserted)`
 
 // Persist every result in one transaction; anything but running is stored as false
-func updateStatuses(ctx context.Context, database Database, results []ProcessStatus) (updated, inserted int64, err error) {
-	if len(results) == 0 {
-		return 0, 0, nil
-	}
+func saveStatuses(ctx context.Context, database DatabaseConfig, results []ProcessStatus) (updated, inserted int64, err error) {
 	running := make([]bool, len(results))
 	names := make([]string, len(results))
 	hosts := make([]string, len(results))
@@ -55,29 +58,30 @@ func updateStatuses(ctx context.Context, database Database, results []ProcessSta
 		names[index], hosts[index], systems[index] = result.Process, result.Host.Name, result.Host.OS
 	}
 
-	conn, err := pgx.Connect(ctx, fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s connect_timeout=10",
-		dsnValue(database.Host), database.Port, dsnValue(database.Name), dsnValue(database.User), dsnValue(database.Password)))
+	conn, err := pgx.Connect(ctx, fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s connect_timeout=%d",
+		dsnValue(database.Host), database.Port, dsnValue(database.Name), dsnValue(database.User),
+		dsnValue(database.Password), connectSeconds))
 	if err != nil {
-		return 0, 0, fmt.Errorf("PostgreSQL connection failed: %s", oneLine(err))
+		return 0, 0, fmt.Errorf("PostgreSQL connection failed: %s", reason(err))
 	}
-	defer conn.Close(context.WithoutCancel(ctx))
+	// Closing discards an uncommitted transaction
+	defer disconnect(conn)
 
 	tx, err := conn.Begin(ctx)
 	if err != nil {
-		return 0, 0, fmt.Errorf("PostgreSQL update failed: %s", oneLine(err))
+		return 0, 0, fmt.Errorf("PostgreSQL update failed: %s", reason(err))
 	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
 	// Naive UTC to match the TIMESTAMP column
 	err = tx.QueryRow(ctx, persistQuery, running, names, hosts, systems, time.Now().UTC()).Scan(&updated, &inserted)
 	if err != nil {
-		return 0, 0, fmt.Errorf("PostgreSQL update failed: %s", oneLine(err))
+		return 0, 0, fmt.Errorf("PostgreSQL update failed: %s", reason(err))
 	}
 	if updated+inserted != int64(len(results)) {
-		return 0, 0, fmt.Errorf("Persisted %d rows for %d process results; ensure existing (name, host, os) entries are unique",
+		return 0, 0, fmt.Errorf("matched %d rows for %d results; existing (name, host, os) rows must be unique",
 			updated+inserted, len(results))
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, 0, fmt.Errorf("PostgreSQL update failed: %s", oneLine(err))
+		return 0, 0, fmt.Errorf("PostgreSQL update failed: %s", reason(err))
 	}
 	return updated, inserted, nil
 }
@@ -87,7 +91,22 @@ func dsnValue(value string) string {
 	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(value) + "'"
 }
 
-// Single-line error text for terminal output
-func oneLine(err error) string {
+// Bounded close, even after cancellation
+func disconnect(conn *pgx.Conn) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn.Close(ctx)
+}
+
+// Short single-line cause of a PostgreSQL failure
+func reason(err error) string {
+	var server *pgconn.PgError
+	if errors.As(err, &server) {
+		return server.Message
+	}
+	var network *net.OpError
+	if errors.As(err, &network) {
+		return network.Error()
+	}
 	return strings.Join(strings.Fields(err.Error()), " ")
 }

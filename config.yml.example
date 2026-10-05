@@ -1,5 +1,5 @@
 database:
-  # Shared connection settings; reuse across projects if the role has required table permissions.
+  # PostgreSQL connection
   host: "127.0.0.1"
   port: 5432
   name: "monitoring"
@@ -7,21 +7,20 @@ database:
   password: "CHANGE_ME"
 
 settings:
+  # Parallel SSH connections and connect deadline per host
   ssh_concurrency: 4
   ssh_timeout_seconds: 5
-  # Optional CIDR allowlist for literal host IPs; [] disables this restriction.
+  # CIDR allowlist for literal host IPs; [] disables the restriction
   allowed_networks: []
 
-# Each host requires a unique name, address, OS, and non-empty process list.
 hosts:
-  # Documentation-only address and sample Linux process names.
+  # Documentation-only addresses; ssh_user and ssh_port are optional
   - name: "linux-server-01"
     address: "192.0.2.10"
     os: "Linux"
     ssh_user: "automation"
     ssh_port: 22
     processes: ["nginx", "postgres"]
-  # Documentation-only address and sample Windows process names.
   - name: "windows-server-01"
     address: "198.51.100.10"
     os: "Windows"
