@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -18,6 +21,8 @@ const validConfig = `database:
   user: "monitoring"
   password: "secret"
 settings:
+  ssh_concurrency: 4
+  ssh_timeout_seconds: 2.5
   allowed_networks: ["192.0.2.0/24"]
 hosts:
   - name: "linux-01"
@@ -41,16 +46,41 @@ func parseYAML(t *testing.T, text string) (Config, error) {
 	return parseConfig(document)
 }
 
-func TestParseConfig(t *testing.T) {
-	config, err := parseYAML(t, validConfig)
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Fake ssh client running a fixed script
+func fakeSSH(t *testing.T, script string) {
+	t.Helper()
+	directory := t.TempDir()
+	writeFile(t, filepath.Join(directory, "ssh"), "#!/bin/sh\n"+script+"\n")
+	if err := os.Chmod(filepath.Join(directory, "ssh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory)
+}
+
+func TestExecutableConfigTakesPrecedence(t *testing.T) {
+	binaryDir, home := t.TempDir(), t.TempDir()
+	writeFile(t, filepath.Join(binaryDir, "config.yml"), validConfig)
+	writeFile(t, filepath.Join(home, ".config", projectName, "config.yml"), "not: valid")
+
+	path, config, err := loadConfig(binaryDir, home)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.Settings.Concurrency != 4 || config.Settings.TimeoutSeconds != 5 {
-		t.Fatalf("unexpected defaults: %+v", config.Settings)
+	if path != filepath.Join(binaryDir, "config.yml") || config.Settings.Timeout != 2500*time.Millisecond {
+		t.Fatalf("unexpected selection: %s %+v", path, config.Settings)
 	}
 	linux, windows := config.Hosts[0], config.Hosts[1]
-	if linux.OS != "Linux" || linux.SSHPort != 22 || linux.SSHUser != "automation" {
+	if linux.OS != osLinux || linux.SSHPort != 22 || linux.SSHUser != "automation" {
 		t.Fatalf("unexpected linux host: %+v", linux)
 	}
 	if windows.SSHPort != 2222 || windows.SSHUser != "" {
@@ -58,48 +88,66 @@ func TestParseConfig(t *testing.T) {
 	}
 }
 
-func TestConfigValidation(t *testing.T) {
-	cases := map[string][2]string{
-		"placeholder":     {`password: "secret"`, `password: "CHANGE_ME"`},
-		"unknown key":     {`settings:`, "settings:\n  retries: 3"},
-		"outside network": {`"192.0.2.10"`, `"198.51.100.10"`},
-		"unknown os":      {`os: "linux"`, `os: "plan9"`},
-		"option address":  {`"win.example"`, `"-oProxyCommand=x"`},
-		"duplicate":       {`["nginx", "postgres"]`, `["nginx", "nginx"]`},
-		"bad port":        {`ssh_port: 2222`, `ssh_port: 70000`},
-		"no processes":    {`["spoolsv.exe"]`, `[]`},
-	}
-	for name, replacement := range cases {
-		if _, err := parseYAML(t, strings.Replace(validConfig, replacement[0], replacement[1], 1)); err == nil {
-			t.Errorf("%s: expected an error", name)
-		}
+func TestInvalidConfigDoesNotFallBackOrLeak(t *testing.T) {
+	binaryDir, home := t.TempDir(), t.TempDir()
+	writeFile(t, filepath.Join(binaryDir, "config.yml"), "database: [secret-content\n")
+	writeFile(t, filepath.Join(home, ".config", projectName, "config.yml"), validConfig)
+
+	_, _, err := loadConfig(binaryDir, home)
+	if err == nil || strings.Contains(err.Error(), "secret-content") || !strings.Contains(err.Error(), binaryDir) {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
-func TestConfigSelection(t *testing.T) {
-	home, work := t.TempDir(), t.TempDir()
-	t.Setenv("HOME", home)
-	t.Chdir(work)
-
-	// First run creates a private template and fails
-	if _, _, err := loadConfig(""); err == nil || !strings.Contains(err.Error(), "template created") {
-		t.Fatalf("unexpected error: %v", err)
+func TestFirstRunCreatesTemplate(t *testing.T) {
+	binaryDir, home := t.TempDir(), t.TempDir()
+	_, _, err := loadConfig(binaryDir, home)
+	var created *configCreatedError
+	if !errors.As(err, &created) {
+		t.Fatalf("expected a created template, got %v", err)
 	}
-	info, err := os.Stat(userConfigPath(home))
+	info, err := os.Stat(created.path)
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("unexpected template: %v %v", info, err)
 	}
+	if _, _, err := loadConfig(binaryDir, home); err == nil || !strings.Contains(err.Error(), "edit placeholder value at database.password") {
+		t.Fatalf("unedited template accepted: %v", err)
+	}
 
-	// Working directory wins over the user file
-	local := filepath.Join(work, configFilename)
-	if err := os.WriteFile(local, []byte(validConfig), 0o600); err != nil {
+	example, err := os.ReadFile("config.yml.example")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if path, _, err := loadConfig(""); err != nil || path != local {
-		t.Fatalf("unexpected selection: %s %v", path, err)
+	var fromExample, fromDefault any
+	if yaml.Unmarshal(example, &fromExample) != nil || yaml.Unmarshal([]byte(defaultConfig), &fromDefault) != nil ||
+		fmt.Sprint(fromExample) != fmt.Sprint(fromDefault) {
+		t.Fatal("config.yml.example differs from the embedded template")
 	}
-	if _, _, err := loadConfig(filepath.Join(work, "missing.yml")); err == nil {
-		t.Fatal("expected an error for a missing explicit path")
+}
+
+func TestConfigValidation(t *testing.T) {
+	cases := map[string][2]string{
+		"placeholder":      {`password: "secret"`, `password: "CHANGE_ME"`},
+		"unknown key":      {`settings:`, "settings:\n  retries: 3"},
+		"missing key":      {"  ssh_concurrency: 4\n", ""},
+		"zero timeout":     {`ssh_timeout_seconds: 2.5`, `ssh_timeout_seconds: 0`},
+		"bad network":      {`"192.0.2.0/24"`, `"192.0.2.0/40"`},
+		"outside network":  {`"192.0.2.10"`, `"198.51.100.10"`},
+		"unknown os":       {`os: "linux"`, `os: "plan9"`},
+		"option address":   {`"win.example"`, `"-oProxyCommand=x"`},
+		"duplicate":        {`["nginx", "postgres"]`, `["nginx", "nginx"]`},
+		"bad port":         {`ssh_port: 2222`, `ssh_port: 70000`},
+		"no processes":     {`["spoolsv.exe"]`, `[]`},
+		"unknown host key": {`ssh_port: 2222`, "ssh_port: 2222\n    extra: 1"},
+		"no hosts":         {validConfig[strings.Index(validConfig, "hosts:"):], "hosts: []\n"},
+	}
+	for name, replace := range cases {
+		if !strings.Contains(validConfig, replace[0]) {
+			t.Fatalf("%s: base text not found", name)
+		}
+		if _, err := parseYAML(t, strings.Replace(validConfig, replace[0], replace[1], 1)); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
 	}
 }
 
@@ -122,39 +170,46 @@ func TestRemoteCommands(t *testing.T) {
 	}
 }
 
-// Fake ssh client echoing fixed output
-func fakeSSH(t *testing.T, script string) {
-	t.Helper()
-	directory := t.TempDir()
-	if err := os.WriteFile(filepath.Join(directory, "ssh"), []byte("#!/bin/sh\n"+script+"\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", directory)
-}
-
 func TestCheckHost(t *testing.T) {
-	host := RemoteHost{Name: "linux-01", Address: "192.0.2.10", OS: "Linux", Processes: []string{"nginx", "postgres"}, SSHPort: 22}
-	limit := make(chan struct{}, 1)
+	host := RemoteHost{Name: "linux-01", Address: "192.0.2.10", OS: osLinux, Processes: []string{"nginx", "postgres"}, SSHPort: 22}
 
 	fakeSSH(t, `printf '1\n0\n'`)
-	results := checkHost(context.Background(), host, limit, 1)
+	results := checkHost(context.Background(), host, time.Second)
 	if results[0].State != stateRunning || results[1].State != stateStopped {
 		t.Fatalf("unexpected results: %+v", results)
 	}
 
-	fakeSSH(t, `echo 'Permission denied (publickey).' >&2; exit 255`)
-	results = checkHost(context.Background(), host, limit, 1)
-	if results[0].State != stateUnknown || results[1].Detail != "Permission denied (publickey)." {
-		t.Fatalf("unexpected results: %+v", results)
+	reasons := map[string]string{
+		`echo 'user@host: Permission denied (publickey).' >&2; exit 255`: "authentication failed",
+		`echo 'Host key verification failed.' >&2; exit 255`:             "host key not trusted",
+		`echo 'sh: 1: something odd' >&2; exit 1`:                        "sh: 1: something odd",
+		`exit 3`: "missing remote dependency: pgrep",
+		`echo 1`: "invalid remote output",
+	}
+	for script, reason := range reasons {
+		fakeSSH(t, script)
+		results = checkHost(context.Background(), host, time.Second)
+		if results[0].State != stateUnknown || results[1].Reason != reason {
+			t.Errorf("%s: unexpected results: %+v", script, results)
+		}
 	}
 
-	fakeSSH(t, `exit 3`)
-	if results = checkHost(context.Background(), host, limit, 1); results[0].Detail != "Remote process-check command is unavailable" {
+	// No ssh client at all
+	t.Setenv("PATH", t.TempDir())
+	if results = checkHost(context.Background(), host, time.Second); results[0].Reason != "missing local dependency: ssh" {
 		t.Fatalf("unexpected results: %+v", results)
 	}
+}
 
-	fakeSSH(t, `echo 1`)
-	if results = checkHost(context.Background(), host, limit, 1); results[0].Detail != "Remote process check returned invalid output" {
+func TestStalledHostFailsWithinDeadline(t *testing.T) {
+	host := RemoteHost{Name: "linux-01", Address: "192.0.2.10", OS: osLinux, Processes: []string{"nginx"}, SSHPort: 22}
+	fakeSSH(t, `exec /bin/sleep 60`)
+	started := time.Now()
+	results := checkHost(context.Background(), host, 200*time.Millisecond-checkGrace)
+	if time.Since(started) > 3*time.Second {
+		t.Fatalf("deadline ignored: %v", time.Since(started))
+	}
+	if results[0].State != stateUnknown || results[0].Reason != "timeout" {
 		t.Fatalf("unexpected results: %+v", results)
 	}
 }
