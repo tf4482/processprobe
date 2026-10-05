@@ -50,8 +50,8 @@ Without `--config`, the first existing file is used, without merging:
 1. `config.yml` in the current working directory
 2. `~/.config/processprobe/config.yml`
 
-If neither exists, the second one is created with placeholders and the run exits `1`. See
-[`config.example.yml`](config.example.yml):
+If neither exists, the second one is created with placeholders and the run exits `1`. Copy
+[`config.yml.example`](config.yml.example) to `config.yml`, then set your database credentials and hosts:
 
 | Setting | Description | Default |
 | --- | --- | --- |
