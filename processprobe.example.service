@@ -1,0 +1,11 @@
+[Unit]
+Description=Probing running processes
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=user0
+ExecStart=/usr/local/bin/processprobe
+TimeoutStartSec=2min
+PrivateTmp=yes
