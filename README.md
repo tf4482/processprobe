@@ -8,12 +8,15 @@ processes are running, and writes each result to PostgreSQL. Ships as a single s
 - 🐧 **Linux hosts**: exact process-name match with `pgrep -x`.
 - 🪟 **Windows hosts**: case-insensitive match with PowerShell `Get-Process`; `.exe` suffix optional.
 - 🔐 **One SSH connection per host**: non-interactive batch mode with strict host keys.
-- ⚡ **Concurrent**: configurable SSH concurrency and timeout.
+- ⚡ **Concurrent**: configurable SSH concurrency and a hard deadline per host.
 - 🛡️ **Network allowlist**: optional CIDR restriction for literal host IPs.
 - 💾 **Upsert**: updates rows matched by `(name, host, os)` and inserts missing ones in one transaction.
-- ✅ **Strict configuration**: unknown keys, placeholders, and duplicates are rejected before any check.
+- ✅ **Strict configuration**: missing and unknown keys, placeholders, and duplicates are rejected before
+  any check.
+- 🧭 **Stable reasons**: unreachable hosts report a short cause such as `timeout` or
+  `authentication failed`.
 - 📝 **First run**: creates a user-only config template.
-- 🌈 **Output**: colored with emojis; plain when redirected, `NO_COLOR` is set, or `TERM=dumb`.
+- 🌈 **Output**: colored with emojis; plain when redirected or `NO_COLOR` is set.
 
 ## 📦 Install
 
@@ -45,26 +48,27 @@ CREATE TABLE IF NOT EXISTS processes (
 
 ## ⚙️ Configuration
 
-Without `--config`, the first existing file is used, without merging:
+The first existing file is used, without merging:
 
-1. `config.yml` in the current working directory
+1. `config.yml` beside the executable
 2. `~/.config/processprobe/config.yml`
 
-If neither exists, the second one is created with placeholders and the run exits `1`. Copy
-[`config.yml.example`](config.yml.example) to `config.yml`, then set your database credentials and hosts:
+If neither exists, the second one is created with dummy values and the run exits `1`. Copy
+[`config.yml.example`](config.yml.example) to one of these locations, replace `CHANGE_ME`, and set your
+hosts:
 
-| Setting | Description | Default |
-| --- | --- | --- |
-| `database.host`, `port`, `name`, `user`, `password` | PostgreSQL target | required |
-| `settings.ssh_concurrency` | Parallel SSH connections | `4` |
-| `settings.ssh_timeout_seconds` | SSH connect timeout; hard limit is 5 s longer | `5` |
-| `settings.allowed_networks` | CIDR allowlist for literal host IPs; DNS names always pass | `[]` |
-| `hosts[].name` | Identity stored in the `host` column | required |
-| `hosts[].address` | DNS name or IP passed to SSH | required |
-| `hosts[].os` | `Linux` or `Windows`, case-insensitive | required |
-| `hosts[].processes` | Non-empty list of exact process names | required |
-| `hosts[].ssh_user` | SSH account | SSH config |
-| `hosts[].ssh_port` | SSH port | `22` |
+| Setting | Description |
+| --- | --- |
+| `database.host`, `port`, `name`, `user`, `password` | PostgreSQL target |
+| `settings.ssh_concurrency` | Parallel SSH connections |
+| `settings.ssh_timeout_seconds` | SSH connect deadline; the whole check may take 5 s longer |
+| `settings.allowed_networks` | CIDR allowlist for literal host IPs; DNS names always pass; `[]` disables it |
+| `hosts[].name` | Identity stored in the `host` column |
+| `hosts[].address` | DNS name or IP passed to SSH |
+| `hosts[].os` | `Linux` or `Windows`, case-insensitive |
+| `hosts[].processes` | Non-empty list of exact process names |
+| `hosts[].ssh_user` | Optional SSH account; the SSH configuration decides without it |
+| `hosts[].ssh_port` | Optional SSH port, `22` without it |
 
 Linux names are case-sensitive and truncated by the kernel to 15 characters; use `ps -eo comm`.
 
@@ -72,8 +76,7 @@ Linux names are case-sensitive and truncated by the kernel to 15 characters; use
 
 ```bash
 processprobe
-processprobe --config /path/to/config.yml
-processprobe --help
+processprobe --help   # also: -h, help
 ```
 
 Authentication must be non-interactive and every host key must already be in `known_hosts`:
@@ -85,14 +88,17 @@ ssh automation@windows-server-01 powershell.exe -NoProfile -Command Get-Process
 
 | Exit | Meaning |
 | --- | --- |
-| `0` | Checks finished and all results were saved |
-| `1` | Configuration or database error |
-| `2` | Invalid command-line arguments |
+| `0` | Every process was checked and saved; stopped processes are not errors |
+| `1` | Configuration, dependency, database, or unreachable-host error |
 | `130` | Interrupted by the user |
+
+Processes on a host that could not be checked are reported as `unknown`, stored as `FALSE`, and make
+the run exit `1`.
 
 ## ⏱️ Deploy
 
-Install the binary, place the configuration, then schedule it with the example systemd units:
+Install the binary, place the configuration, then schedule it with the example systemd units. The timer
+waits for the previous run to finish, so runs never overlap.
 
 ```bash
 sudo install -m 644 processprobe.example.service /etc/systemd/system/processprobe.service
@@ -102,7 +108,7 @@ sudo systemctl enable --now processprobe.timer
 journalctl -u processprobe.service
 ```
 
-Adjust `User=` in the service; that account needs `~/.config/processprobe/config.yml` and its SSH keys.
+Adjust `User=` in the service; that account needs the configuration and its SSH keys.
 
 ## 🧪 Develop
 
