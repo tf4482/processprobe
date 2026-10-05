@@ -1,104 +1,116 @@
-# {{Project Name}} 🚀
+# 🔎 processprobe
 
-{{Briefly describe what this project does, who it is for, and which problem it solves.}}
+One-shot Linux CLI that connects to Linux and Windows hosts over SSH, checks whether configured
+processes are running, and writes each result to PostgreSQL. Ships as a single static binary.
 
-## Features ✨
+## ✨ Features
 
-- **{{Feature 1}}**: {{Describe the feature and its benefit.}}
-- **{{Feature 2}}**: {{Describe the feature and its benefit.}}
-- **{{Feature 3}}**: {{Describe the feature and its benefit.}}
+- 🐧 **Linux hosts**: exact process-name match with `pgrep -x`.
+- 🪟 **Windows hosts**: case-insensitive match with PowerShell `Get-Process`; `.exe` suffix optional.
+- 🔐 **One SSH connection per host**: non-interactive batch mode with strict host keys.
+- ⚡ **Concurrent**: configurable SSH concurrency and timeout.
+- 🛡️ **Network allowlist**: optional CIDR restriction for literal host IPs.
+- 💾 **Upsert**: updates rows matched by `(name, host, os)` and inserts missing ones in one transaction.
+- ✅ **Strict configuration**: unknown keys, placeholders, and duplicates are rejected before any check.
+- 📝 **First run**: creates a user-only config template.
+- 🌈 **Output**: colored with emojis; plain when redirected, `NO_COLOR` is set, or `TERM=dumb`.
 
-## Prerequisites 📋
+## 📦 Install
 
-- {{Required language or runtime and supported version}}
-- {{Required package manager or build tools}}
-- {{Additional services or accounts, if applicable}}
+Building needs Go 1.26+. Running needs the OpenSSH client and PostgreSQL access; remote hosts need
+`pgrep` (Linux) or PowerShell with an OpenSSH server (Windows).
 
-## Installation 🚀
+```bash
+git clone https://github.com/tf4482/processprobe.git
+cd processprobe
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/processprobe .
+sudo install -m 755 dist/processprobe /usr/local/bin/processprobe
+```
 
-1. Clone the repository:
+## 🗄️ Database
 
-   ```bash
-   git clone https://github.com/{{username}}/{{repository}}.git
-   cd {{repository}}
-   ```
+```sql
+CREATE TABLE IF NOT EXISTS processes (
+    name TEXT NOT NULL,
+    status BOOLEAN,
+    host TEXT,
+    os TEXT,
+    last_check TIMESTAMP,
+    UNIQUE (name, host, os)
+);
+```
 
-2. Install the required dependencies:
+`status` is `TRUE` only for a confirmed running process; stopped and unknown results are `FALSE`.
+`last_check` is naive UTC. Duplicate `(name, host, os)` rows fail the run and roll back.
 
-   ```text
-   {{install command}}
-   ```
+## ⚙️ Configuration
 
-3. Configure the project as described below.
+Without `--config`, the first existing file is used, without merging:
 
-## Configuration ⚙️
+1. `config.yml` in the current working directory
+2. `~/.config/processprobe/config.yml`
 
-{{Describe where configuration is stored and how to create a local configuration from the provided example, if applicable.}}
+If neither exists, the second one is created with placeholders and the run exits `1`. See
+[`config.example.yml`](config.example.yml):
 
 | Setting | Description | Default |
 | --- | --- | --- |
-| `{{SETTING_1}}` | {{Purpose of this setting}} | `{{default value}}` |
-| `{{SETTING_2}}` | {{Purpose of this setting}} | `{{default value}}` |
+| `database.host`, `port`, `name`, `user`, `password` | PostgreSQL target | required |
+| `settings.ssh_concurrency` | Parallel SSH connections | `4` |
+| `settings.ssh_timeout_seconds` | SSH connect timeout; hard limit is 5 s longer | `5` |
+| `settings.allowed_networks` | CIDR allowlist for literal host IPs; DNS names always pass | `[]` |
+| `hosts[].name` | Identity stored in the `host` column | required |
+| `hosts[].address` | DNS name or IP passed to SSH | required |
+| `hosts[].os` | `Linux` or `Windows`, case-insensitive | required |
+| `hosts[].processes` | Non-empty list of exact process names | required |
+| `hosts[].ssh_user` | SSH account | SSH config |
+| `hosts[].ssh_port` | SSH port | `22` |
 
-## Usage 🖥️
+Linux names are case-sensitive and truncated by the kernel to 15 characters; use `ps -eo comm`.
 
-Start the project:
+## 🚀 Usage
 
-```text
-{{start command}}
+```bash
+processprobe
+processprobe --config /path/to/config.yml
+processprobe --help
 ```
 
-### Example
+Authentication must be non-interactive and every host key must already be in `known_hosts`:
 
-{{Describe a typical use case.}}
-
-```text
-{{example command or code}}
+```bash
+ssh automation@linux-server-01 true
+ssh automation@windows-server-01 powershell.exe -NoProfile -Command Get-Process
 ```
 
-{{Describe the expected result.}}
-
-## Project Structure 📁
-
-{{Adapt the following structure to your project.}}
-
-| Path | Purpose |
+| Exit | Meaning |
 | --- | --- |
-| `src/` | Application source code |
-| `tests/` | Automated tests |
-| `docs/` | Additional documentation |
-| `assets/` | Static resources |
-| `.gitignore` | Git ignore rules |
-| `README.md` | Project documentation |
-| `LICENSE` | License terms |
+| `0` | Checks finished and all results were saved |
+| `1` | Configuration or database error |
+| `2` | Invalid command-line arguments |
+| `130` | Interrupted by the user |
 
-## Development 🔧
+## ⏱️ Deploy
 
-{{Describe any additional setup required for local development.}}
+Install the binary, place the configuration, then schedule it with the example systemd units:
 
-Run the tests:
-
-```text
-{{test command}}
+```bash
+sudo install -m 644 processprobe.example.service /etc/systemd/system/processprobe.service
+sudo install -m 644 processprobe.example.timer /etc/systemd/system/processprobe.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now processprobe.timer
+journalctl -u processprobe.service
 ```
 
-Build the project, if applicable:
+Adjust `User=` in the service; that account needs `~/.config/processprobe/config.yml` and its SSH keys.
 
-```text
-{{build command}}
+## 🧪 Develop
+
+```bash
+go vet ./...
+go test ./...
 ```
 
-## Contributing 🤝
+## 📜 License
 
-Contributions are welcome! Open an issue to report a bug or suggest an improvement.
-
-To contribute code:
-
-1. Fork the repository and create a branch.
-2. Make your changes and update relevant tests and documentation.
-3. Run the available checks.
-4. Submit a pull request describing your changes.
-
-## License 📜
-
-This project is licensed under the {{License Name}}. See the [LICENSE](LICENSE) file for details.
+MIT, see [LICENSE](LICENSE).
