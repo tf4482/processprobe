@@ -1,29 +1,27 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"net/netip"
-	"os"
-	"path/filepath"
-	"regexp"
-	"sort"
 	"strings"
+	"time"
 	"unicode"
-
-	"gopkg.in/yaml.v3"
 )
 
+// Operating systems as stored in the database
 const (
-	appName        = "processprobe"
-	configFilename = "config.yml"
+	osLinux   = "Linux"
+	osWindows = "Windows"
+
+	defaultSSHPort = 22
 )
 
-const configTemplate = `database:
+// Must match config.yml.example
+const defaultConfig = `database:
   host: "127.0.0.1"
   port: 5432
-  name: "process_status"
-  user: "status_user"
+  name: "monitoring"
+  user: "monitoring"
   password: "CHANGE_ME"
 
 settings:
@@ -31,11 +29,23 @@ settings:
   ssh_timeout_seconds: 5
   allowed_networks: []
 
-hosts: []
+hosts:
+  - name: "linux-server-01"
+    address: "192.0.2.10"
+    os: "Linux"
+    ssh_user: "automation"
+    ssh_port: 22
+    processes: ["nginx", "postgres"]
+  - name: "windows-server-01"
+    address: "198.51.100.10"
+    os: "Windows"
+    ssh_user: "automation"
+    ssh_port: 22
+    processes: ["spoolsv.exe", "notepad.exe"]
 `
 
 // PostgreSQL connection target
-type Database struct {
+type DatabaseConfig struct {
 	Host     string
 	Port     int
 	Name     string
@@ -43,10 +53,10 @@ type Database struct {
 	Password string
 }
 
-// SSH limits and optional CIDR allowlist
+// SSH limit, connect deadline, and optional CIDR allowlist
 type Settings struct {
 	Concurrency     int
-	TimeoutSeconds  int
+	Timeout         time.Duration
 	AllowedNetworks []netip.Prefix
 }
 
@@ -62,263 +72,53 @@ type RemoteHost struct {
 
 // Validated configuration
 type Config struct {
-	Database Database
+	Database DatabaseConfig
 	Settings Settings
 	Hosts    []RemoteHost
 }
 
-// Exact path, else ./config.yml, else the user file; empty when none exists
-func selectConfigPath(explicit string) (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	if explicit != "" {
-		path := explicit
-		if strings.HasPrefix(path, "~/") {
-			path = filepath.Join(home, path[2:])
-		}
-		if !isFile(path) {
-			return "", fmt.Errorf("Configuration file not found: %s", explicit)
-		}
-		return path, nil
-	}
-	local, err := filepath.Abs(configFilename)
-	if err != nil {
-		return "", err
-	}
-	for _, candidate := range []string{local, userConfigPath(home)} {
-		if isFile(candidate) {
-			return candidate, nil
-		}
-	}
-	return "", nil
-}
-
-func userConfigPath(home string) string {
-	return filepath.Join(home, ".config", appName, configFilename)
-}
-
-func isFile(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.Mode().IsRegular()
-}
-
-// First existing file wins; no merging, no fallback
-func loadConfig(explicit string) (string, Config, error) {
-	selected, err := selectConfigPath(explicit)
-	if err != nil {
-		return "", Config{}, err
-	}
-	if selected == "" {
-		created, err := createConfigTemplate()
-		if err != nil {
-			return "", Config{}, err
-		}
-		return "", Config{}, fmt.Errorf("Configuration template created at %s; edit it and rerun", created)
-	}
-
-	data, err := os.ReadFile(selected)
-	if err != nil {
-		return "", Config{}, fmt.Errorf("Cannot read YAML configuration %s: %v", selected, err)
-	}
-	var document any
-	if err := yaml.Unmarshal(data, &document); err != nil {
-		return "", Config{}, fmt.Errorf("Invalid YAML configuration %s%s", selected, yamlLocation(err))
-	}
-	config, err := parseConfig(document)
-	return selected, config, err
-}
-
-var yamlLine = regexp.MustCompile(`line (\d+)`)
-
-// Line number only; never echoes file content
-func yamlLocation(err error) string {
-	if match := yamlLine.FindStringSubmatch(err.Error()); match != nil {
-		return " at line " + match[1]
-	}
-	return ""
-}
-
-// User-only placeholder file; an existing one is kept
-func createConfigTemplate() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	path := userConfigPath(home)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return "", fmt.Errorf("Cannot create YAML configuration %s: %v", path, err)
-	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if errors.Is(err, os.ErrExist) {
-		return path, nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("Cannot create YAML configuration %s: %v", path, err)
-	}
-	_, err = file.WriteString(configTemplate)
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return "", fmt.Errorf("Cannot create YAML configuration %s: %v", path, err)
-	}
-	return path, nil
-}
-
-// Validation failure raised while parsing
-type configError struct{ error }
-
-func fail(format string, args ...any) {
-	panic(configError{fmt.Errorf(format, args...)})
-}
-
 // Strict validation of the decoded YAML document
-func parseConfig(document any) (config Config, err error) {
-	defer func() {
-		switch failure := recover().(type) {
-		case nil:
-		case configError:
-			config, err = Config{}, failure.error
-		default:
-			panic(failure)
-		}
-	}()
+func parseConfig(document any) (Config, error) {
+	r := &reader{}
+	root := r.mapping(document, "configuration")
+	database := r.mapping(root["database"], "database")
+	settings := r.mapping(root["settings"], "settings")
+	r.exactKeys(root, "configuration", "database", "settings", "hosts")
+	r.exactKeys(database, "database", "host", "port", "name", "user", "password")
+	r.exactKeys(settings, "settings", "ssh_concurrency", "ssh_timeout_seconds", "allowed_networks")
 
-	root := mapping(document, "configuration")
-	checkKeys(root, "configuration", []string{"database", "settings", "hosts"})
-	database := mapping(root["database"], "database")
-	settings := mapping(root["settings"], "settings")
-	hosts, ok := root["hosts"].([]any)
-	if !ok {
-		fail("hosts must be a list")
+	config := Config{
+		Database: DatabaseConfig{
+			Host:     r.text(database, "host", "database"),
+			Port:     r.port(database, "port", "database"),
+			Name:     r.text(database, "name", "database"),
+			User:     r.text(database, "user", "database"),
+			Password: r.text(database, "password", "database"),
+		},
+		Settings: Settings{
+			Concurrency:     r.positiveInt(settings, "ssh_concurrency", "settings"),
+			Timeout:         r.positiveSeconds(settings, "ssh_timeout_seconds", "settings"),
+			AllowedNetworks: r.networks(settings),
+		},
 	}
-	checkKeys(database, "database", []string{"host", "port", "name", "user", "password"})
-	checkKeys(settings, "settings", nil, "ssh_concurrency", "ssh_timeout_seconds", "allowed_networks")
-
-	config.Database = Database{
-		Host:     databaseText(database, "host"),
-		Port:     positiveInt(database["port"], "database.port", 65535),
-		Name:     databaseText(database, "name"),
-		User:     databaseText(database, "user"),
-		Password: databaseText(database, "password"),
+	config.Hosts = r.hosts(root["hosts"], config.Settings.AllowedNetworks)
+	if r.err != nil {
+		return Config{}, r.err
 	}
-	config.Settings = Settings{
-		Concurrency:     optionalInt(settings, "ssh_concurrency", "settings.ssh_concurrency", 4, 0),
-		TimeoutSeconds:  optionalInt(settings, "ssh_timeout_seconds", "settings.ssh_timeout_seconds", 5, 0),
-		AllowedNetworks: parseNetworks(settings),
-	}
-	config.Hosts = parseHosts(hosts)
-	validateHostNetworks(config.Hosts, config.Settings.AllowedNetworks)
 	return config, nil
 }
 
-func mapping(value any, path string) map[string]any {
-	result, ok := value.(map[string]any)
-	if !ok {
-		fail("%s must be an object", path)
-	}
-	return result
-}
-
-// Reject missing required and unknown keys
-func checkKeys(values map[string]any, location string, required []string, optional ...string) {
-	known := map[string]bool{}
-	var missing, unknown []string
-	for _, key := range required {
-		known[key] = true
-		if _, ok := values[key]; !ok {
-			missing = append(missing, key)
-		}
-	}
-	for _, key := range optional {
-		known[key] = true
-	}
-	for key := range values {
-		if !known[key] {
-			unknown = append(unknown, key)
-		}
-	}
-	sort.Strings(unknown)
-	var details []string
-	if missing != nil {
-		sort.Strings(missing)
-		details = append(details, "missing: "+strings.Join(missing, ", "))
-	}
-	if unknown != nil {
-		details = append(details, "unknown: "+strings.Join(unknown, ", "))
-	}
-	if details != nil {
-		fail("%s keys are invalid (%s)", location, strings.Join(details, "; "))
-	}
-}
-
-// Trimmed non-empty single-line string
-func text(value any, path string) string {
-	raw, ok := value.(string)
-	if !ok || strings.TrimSpace(raw) == "" {
-		fail("%s must be a non-empty string", path)
-	}
-	if strings.ContainsAny(raw, "\x00\r\n") {
-		fail("%s must not contain control characters", path)
-	}
-	return strings.TrimSpace(raw)
-}
-
-// Database string without leftover placeholder
-func databaseText(database map[string]any, key string) string {
-	value := text(database[key], "database."+key)
-	if strings.EqualFold(value, "change_me") || strings.EqualFold(value, "change-me") {
-		fail("database.%s still contains a placeholder", key)
-	}
-	return value
-}
-
-// Value safe to pass as an SSH address or user
-func sshComponent(value any, path string) string {
-	parsed := text(value, path)
-	if strings.HasPrefix(parsed, "-") || strings.ContainsFunc(parsed, unicode.IsSpace) {
-		fail("%s must be a valid SSH address or user component", path)
-	}
-	return parsed
-}
-
-// Positive integer; maximum 0 means unbounded
-func positiveInt(value any, path string, maximum int) int {
-	number, ok := value.(int)
-	if !ok || number <= 0 || (maximum > 0 && number > maximum) {
-		if maximum > 0 {
-			fail("%s must be an integer between 1 and %d", path, maximum)
-		}
-		fail("%s must be a positive integer", path)
-	}
-	return number
-}
-
-func optionalInt(values map[string]any, key, path string, fallback, maximum int) int {
-	value, ok := values[key]
-	if !ok {
-		return fallback
-	}
-	return positiveInt(value, path, maximum)
-}
-
 // CIDR allowlist; bare addresses count as single-host networks
-func parseNetworks(settings map[string]any) []netip.Prefix {
-	value, ok := settings["allowed_networks"]
+func (r *reader) networks(settings map[string]any) []netip.Prefix {
+	items, ok := settings["allowed_networks"].([]any)
 	if !ok {
-		return nil
-	}
-	items, ok := value.([]any)
-	if !ok {
-		fail("settings.allowed_networks must be a list of CIDR networks")
+		r.fail("settings.allowed_networks must be a list of CIDR networks")
 	}
 	var networks []netip.Prefix
-	for _, item := range items {
+	for index, item := range items {
 		network, err := parseNetwork(fmt.Sprint(item))
 		if err != nil {
-			fail("Invalid network in settings.allowed_networks: %v", err)
+			r.fail("settings.allowed_networks[%d] must be an IP address or CIDR network", index)
 		}
 		networks = append(networks, network)
 	}
@@ -334,36 +134,55 @@ func parseNetwork(value string) (netip.Prefix, error) {
 	return network.Masked(), err
 }
 
-func parseHosts(items []any) []RemoteHost {
-	if len(items) == 0 {
-		fail("hosts must contain at least one host")
+// Hosts with unique process identities inside the allowed networks
+func (r *reader) hosts(value any, networks []netip.Prefix) []RemoteHost {
+	items, ok := value.([]any)
+	if !ok || len(items) == 0 {
+		r.fail("hosts must be a non-empty list")
 	}
 	var hosts []RemoteHost
+	// Database rows are matched by (name, host, os)
 	identities := map[[3]string]bool{}
-	for index, rawItem := range items {
-		path := fmt.Sprintf("hosts[%d]", index)
-		item := mapping(rawItem, path)
-		checkKeys(item, path, []string{"name", "address", "os", "processes"}, "ssh_user", "ssh_port")
+	for index, item := range items {
+		location := fmt.Sprintf("hosts[%d]", index)
+		entry := r.mapping(item, location)
+		keys := []string{"name", "address", "os", "processes"}
+		for _, optional := range []string{"ssh_user", "ssh_port"} {
+			if _, ok := entry[optional]; ok {
+				keys = append(keys, optional)
+			}
+		}
+		r.exactKeys(entry, location, keys...)
 
-		rawProcesses, ok := item["processes"].([]any)
-		if !ok || len(rawProcesses) == 0 {
-			fail("%s.processes must be a non-empty list", path)
-		}
 		host := RemoteHost{
-			Name:    text(item["name"], path+".name"),
-			Address: sshComponent(item["address"], path+".address"),
-			OS:      normalizeOS(item["os"], path+".os"),
-			SSHPort: optionalInt(item, "ssh_port", path+".ssh_port", 22, 65535),
+			Name:    r.text(entry, "name", location),
+			Address: r.sshComponent(entry, "address", location),
+			OS:      r.system(entry, location),
+			SSHPort: defaultSSHPort,
 		}
-		if item["ssh_user"] != nil {
-			host.SSHUser = sshComponent(item["ssh_user"], path+".ssh_user")
+		if _, ok := entry["ssh_user"]; ok {
+			host.SSHUser = r.sshComponent(entry, "ssh_user", location)
 		}
-		for processIndex, process := range rawProcesses {
-			name := text(process, fmt.Sprintf("%s.processes[%d]", path, processIndex))
-			// Database rows are matched by (name, host, os)
+		if _, ok := entry["ssh_port"]; ok {
+			host.SSHPort = r.port(entry, "ssh_port", location)
+		}
+		if address, err := netip.ParseAddr(host.Address); err == nil && len(networks) > 0 && !allowed(address, networks) {
+			r.fail("%s.address is outside settings.allowed_networks", location)
+		}
+
+		processes, ok := entry["processes"].([]any)
+		if !ok || len(processes) == 0 {
+			r.fail("%s.processes must be a non-empty list", location)
+		}
+		for position, process := range processes {
+			name, ok := process.(string)
+			name = strings.TrimSpace(name)
+			if !ok || name == "" {
+				r.fail("%s.processes[%d] must be a non-empty string", location, position)
+			}
 			identity := [3]string{name, host.Name, host.OS}
 			if identities[identity] {
-				fail("Duplicate process identity configured: name=%q, host=%q, os=%q", name, host.Name, host.OS)
+				r.fail("%s.processes[%d] repeats a process of host %s", location, position, host.Name)
 			}
 			identities[identity] = true
 			host.Processes = append(host.Processes, name)
@@ -373,41 +192,35 @@ func parseHosts(items []any) []RemoteHost {
 	return hosts
 }
 
-func normalizeOS(value any, path string) string {
-	switch strings.ToLower(text(value, path)) {
-	case "linux":
-		return "Linux"
-	case "windows":
-		return "Windows"
+// Value safe to pass as an SSH address or user
+func (r *reader) sshComponent(values map[string]any, key, location string) string {
+	value := r.text(values, key, location)
+	if strings.HasPrefix(value, "-") || strings.ContainsFunc(value, func(char rune) bool {
+		return unicode.IsSpace(char) || unicode.IsControl(char)
+	}) {
+		r.fail("%s.%s must not start with a dash or contain whitespace", location, key)
 	}
-	fail("%s must be 'Linux' or 'Windows'", path)
+	return value
+}
+
+// Linux or Windows, case-insensitive
+func (r *reader) system(values map[string]any, location string) string {
+	switch strings.ToLower(r.text(values, "os", location)) {
+	case "linux":
+		return osLinux
+	case "windows":
+		return osWindows
+	}
+	r.fail("%s.os must be %s or %s", location, osLinux, osWindows)
 	return ""
 }
 
-// Reject literal IPs outside the allowlist; DNS names pass
-func validateHostNetworks(hosts []RemoteHost, networks []netip.Prefix) {
-	if len(networks) == 0 {
-		return
-	}
-	for _, host := range hosts {
-		address, err := netip.ParseAddr(host.Address)
-		if err != nil {
-			continue
-		}
-		allowed := false
-		for _, network := range networks {
-			allowed = allowed || network.Contains(address)
-		}
-		if !allowed {
-			fail("Host %q has address %q outside allowed networks: %s", host.Name, host.Address, joinNetworks(networks))
+// Literal addresses must lie in one of the networks
+func allowed(address netip.Addr, networks []netip.Prefix) bool {
+	for _, network := range networks {
+		if network.Contains(address) {
+			return true
 		}
 	}
-}
-
-func joinNetworks(networks []netip.Prefix) string {
-	names := make([]string, len(networks))
-	for index, network := range networks {
-		names[index] = network.String()
-	}
-	return strings.Join(names, ", ")
+	return false
 }
